@@ -1,0 +1,435 @@
+"""
+K_Summarizing_evaluation_alignment
+---------------------
+This script aggregates DSM (Design Structure Matrix) evaluation results from multiple runs,
+computes advanced agreement/uncertainty metrics, and outputs structured summaries and heatmaps.
+
+It is part of a Master Thesis framework for evaluating LLM-generated DSMs
+against Ground Truth using repeated experiments.
+
+Pipeline:
+1. Load and align DSM evaluation results (Excel files).
+2. Compute inter-run agreement metrics (Fleiss’ kappa, Raw Agreement).
+3. Aggregate evaluation metrics (accuracy, completeness, etc.).
+4. Compute higher-order measures (entropy, final quality score Q).
+5. Export Excel summaries and generate diagnostic heatmaps.
+
+Expected folder structure (relative to this script):
+- DSM_Evaluation_Results/Evaluated_DSMs/   → input DSM evaluations from GT_comparing_and_metrics
+- DSM_Evaluation_Results/Evaluation_summary/ → outputs (Excel + PNGs)
+
+Usage:
+    K_Summarizing_evaluation_alignment.py
+"""
+import os
+import sys
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, LinearSegmentedColormap
+from glob import glob
+from collections import Counter
+
+# ---------------- Environment Check (Optional) ----------------
+# For reproducibility, you may enforce a specific virtual environment path here.
+EXPECTED_VENV_PATH = None  # Example: r"C:\path\to\venv\Scripts\python.exe"
+
+if os.path.normcase(sys.executable) != os.path.normcase(EXPECTED_VENV_PATH):
+    raise EnvironmentError(
+        f"\nERROR: This script must be run using the Results virtual environment.\n"
+        f"Expected: {EXPECTED_VENV_PATH}\n"
+        f"Got     : {sys.executable}\n"
+        f"Please activate the virtual environment before running this script."
+    )
+
+# -----------------------------------
+# Loading and Alignment
+# -----------------------------------
+def load_and_align_dsms(folder_path):
+    """
+    Load DSM evaluation files and align them to a common label set.
+    """
+    files = glob(os.path.join(folder_path, "*.xlsx"))
+    dsm_data = []
+    labels = set()
+
+    for file in files:
+        df = pd.read_excel(file, sheet_name='DSM', index_col=0)
+        labels.update(df.index)
+    union_labels = sorted(labels)
+
+    for file in files:
+        entry = {'file_name': os.path.basename(file)}
+        xl = pd.ExcelFile(file)
+        for sheet in ['DSM', 'Matched DSM', 'Mismatch DSM', 'Uncertainty DSM']:
+            df = xl.parse(sheet)
+            df.set_index(df.columns[0], inplace=True)
+            aligned = df.reindex(index=union_labels, columns=union_labels, fill_value=np.nan)
+            entry[sheet.lower().replace(' ', '_')] = aligned
+        entry['metrics'] = xl.parse('Evaluation Metrics')
+        dsm_data.append(entry)
+
+    return dsm_data, union_labels
+
+# -----------------------------------
+# Fleiss's Kappa Metric
+# -----------------------------------
+def calculate_fleiss_kappa_matrix(dsm_data, union_labels):
+    categories = [-1, 0, 1]
+    n_cells = len(union_labels)
+
+    total_counts = Counter()
+    for d in dsm_data:
+        flat = d["dsm"].values.flatten()
+        total_counts.update(flat[~np.isnan(flat)].astype(int))
+    total_ratings = sum(total_counts.values())
+    if total_ratings == 0:
+        raise ValueError("No valid DSM ratings found; cannot compute Fleiss kappa.")
+    p = np.array([total_counts[c] for c in categories], dtype=float) / total_ratings
+    P_e = np.sum(p ** 2)
+
+    # --- per‑cell Fleiss κ ---
+    kappa_mat = np.full((n_cells, n_cells), np.nan)
+
+    for r in range(n_cells):
+        for c in range(n_cells):
+            if r == c:
+                continue                                      # skip diagonal
+
+            ratings = []
+            for d in dsm_data:
+                val = d["dsm"].iloc[r, c]
+                if pd.isna(val):
+                    continue
+                ratings.append(int(val))                     # cast −1, 0, 1 to int
+            n = len(ratings)
+            if n < 5:                                        # too few ratings → leave NaN
+                continue
+
+            counts = Counter(ratings)
+            counts.update({-1: 0, 0: 0, 1: 0})
+
+            P_i = sum(v * (v - 1) for v in counts.values()) / (n * (n - 1))
+            kappa_mat[r, c] = (P_i - P_e) / (1 - P_e)
+
+    avg_kappa = np.nanmean(kappa_mat)
+    # guard: if every cell is NaN, keep it explicit rather than propagating silently
+    if np.isnan(avg_kappa):
+        avg_kappa = np.nan
+    kappa_df = pd.DataFrame(kappa_mat, index=union_labels, columns=union_labels)
+    return kappa_df, avg_kappa
+
+
+# -----------------------------------
+# Raw Agreement Metric
+# -----------------------------------
+def calculate_raw_agreement(dsm_data, union_labels, summary_df):
+    n_elements = len(union_labels)
+    agreement_matrix = np.full((n_elements, n_elements), np.nan)
+
+    for r in range(n_elements):
+        for c in range(n_elements):
+            if r == c:
+                continue  # Skip diagonal
+            values = [d['dsm'].iloc[r, c] for d in dsm_data if not pd.isna(d['dsm'].iloc[r, c])]
+            if not values:
+                continue  # Leave as NaN
+            counts = {val: values.count(val) for val in (-1, 0, 1)}
+            agreement_matrix[r, c] = max(counts.values()) / len(values)
+
+    flat_agreements = agreement_matrix[~np.eye(n_elements, dtype=bool)].flatten()
+    flat_agreements = flat_agreements[~np.isnan(flat_agreements)]
+
+    avg_raw_agreement = np.mean(flat_agreements)
+    std_raw_agreement = np.std(flat_agreements, ddof=0)
+    n_cells = len(flat_agreements)
+    ci_95 = 1.96 * std_raw_agreement / np.sqrt(n_cells)
+
+    print(f"Average Raw Agreement across DSM cells: {avg_raw_agreement:.4f}")
+    print(f"STD of Raw Agreement: {std_raw_agreement:.4f}")
+    print(f"95% Confidence Interval: ±{ci_95:.4f} → [{avg_raw_agreement - ci_95:.4f}, {avg_raw_agreement + ci_95:.4f}]")
+
+    new_row = pd.DataFrame([['Raw Agreement Rate', np.nan, avg_raw_agreement, std_raw_agreement]],
+                           columns=summary_df.columns)
+    summary_df = pd.concat([summary_df, new_row], ignore_index=True)
+
+    return pd.DataFrame(agreement_matrix, index=union_labels, columns=union_labels), summary_df
+
+
+# -----------------------------------
+# Metric Aggregation
+# -----------------------------------
+def aggregate_evaluation_metrics(dsm_data):
+    metric_names = dsm_data[0]['metrics']['Metric'].tolist()
+    rows = []
+    for i, d in enumerate(dsm_data):
+        row = {'Iteration': i+1}
+        for m in metric_names:
+            row[m] = d['metrics'].loc[d['metrics']['Metric']==m, 'Value'].iat[0]
+        rows.append(row)
+    overview = pd.DataFrame(rows)
+    # sum only first 10 metrics of list 
+    count_metrics = 10
+    totals = overview[metric_names].iloc[:, :count_metrics].sum().tolist() + [np.nan]*(len(metric_names)-count_metrics)
+    means = overview[metric_names].mean().tolist()
+    stds  = overview[metric_names].std(ddof=0).tolist()
+    summary = pd.DataFrame({'Metric': metric_names, 'Total': totals, 'Mean': means, 'STD': stds})
+    return summary, overview
+
+# -----------------------------------
+# Entropy Calculation
+# -----------------------------------
+def calculate_entropy_per_cell(dsm_data, union_labels, summary_df):
+    n = len(union_labels)
+    norm_entropy_matrix = np.zeros((n, n))
+
+    def entropy_term(p):
+        return 0 if p == 0 else p * np.log2(p)
+
+    for r in range(n):
+        for c in range(n):
+            values = [d['dsm'].iloc[r, c] for d in dsm_data]
+            values = [v for v in values if not pd.isna(v)]
+            if not values:
+                norm_entropy_matrix[r, c] = np.nan
+                continue
+            counts = np.array([values.count(-1), values.count(0), values.count(1)])
+            probs = counts / len(values)
+            entropy_raw = -sum(entropy_term(p) for p in probs)
+            norm_entropy_matrix[r, c] = entropy_raw / np.log2(3)          # normalised
+
+
+    entropy_df = pd.DataFrame(norm_entropy_matrix, index=union_labels, columns=union_labels)
+    avg_entropy = np.nanmean(norm_entropy_matrix)
+    std_entropy = np.nanstd(norm_entropy_matrix)
+
+    new_row = pd.DataFrame([['Normalized Entropy', np.nan, avg_entropy, std_entropy]], columns=summary_df.columns)
+    summary_df = pd.concat([summary_df, new_row], ignore_index=True)
+    return entropy_df, summary_df, avg_entropy
+
+# -----------------------------------
+# Fill Ratio Matrix Calculation    
+# -----------------------------------
+def calculate_fill_ratio_matrix(dsm_data, union_labels):
+    matrix = np.zeros((len(union_labels), len(union_labels)))
+    for r in range(len(union_labels)):
+        for c in range(len(union_labels)):
+            filled = [not pd.isna(d['dsm'].iloc[r, c]) for d in dsm_data]
+            matrix[r, c] = sum(filled) / len(dsm_data)
+    return pd.DataFrame(matrix, index=union_labels, columns=union_labels)
+
+# -----------------------------------
+# Final Quality Metric Calculation  
+# -----------------------------------
+def calculate_final_quality_metric(dsm_data, union_labels, summary_df, entropy_df, avg_entropy):
+    w_acc = 0.5
+    w_stab = 0.3
+    w_pen = 0.2
+    
+    max_Q = w_acc + w_stab
+    min_Q = - w_pen
+
+    performance_matrix = np.zeros((len(union_labels), len(union_labels)))
+
+    for r in range(len(union_labels)):
+        for c in range(len(union_labels)):
+            matched_values = [d['matched_dsm'].iloc[r, c] for d in dsm_data if not pd.isna(d['matched_dsm'].iloc[r, c])]
+            mismatch_values = [d['mismatch_dsm'].iloc[r, c] for d in dsm_data if not pd.isna(d['mismatch_dsm'].iloc[r, c])]
+            
+            correct = sum(v == 1 for v in matched_values)
+            incorrect = sum(v in (-1, 1) for v in mismatch_values)
+            idk = sum(v == 0 for v in mismatch_values)
+            confident = correct + incorrect
+            total_trials = len(matched_values) + len(mismatch_values) 
+
+            sa_rc = correct / confident if confident > 0 else 0.0
+
+            penalty = (incorrect + 0.5 * idk) / total_trials if total_trials else np.nan
+
+            ent = entropy_df.iloc[r, c]
+
+            if not np.isnan(sa_rc) and not np.isnan(ent) and not np.isnan(penalty):
+                Q = w_acc * sa_rc + w_stab * (1 - ent) - w_pen * penalty
+                performance_matrix[r, c] = (Q - min_Q) / (max_Q - min_Q)
+            else:
+                performance_matrix[r, c] = np.nan
+    
+    performance_df = pd.DataFrame(performance_matrix, index=union_labels, columns=union_labels)
+    avg_Q_cell = performance_df.mean().mean()
+    std_Q_cell = performance_df.values.std()
+
+    summary_df = pd.concat([
+        summary_df,
+        pd.DataFrame([['Final Normalized Quality Score (Q) based per cell', np.nan, avg_Q_cell, std_Q_cell]], columns=summary_df.columns)
+    ])
+    return summary_df, performance_df
+
+# -----------------------------------
+# Frequency Matrix Calculation
+# -----------------------------------
+def calculate_frequency_matrix(dsm_data, union_labels, key, target_value):
+    n_runs   = len(dsm_data)
+    n_labels = len(union_labels)
+    freq_mat = np.full((n_labels, n_labels), np.nan)
+
+    for r in range(n_labels):
+        for c in range(n_labels):
+            count_hits = 0
+            for d in dsm_data:
+                val = d[key].iloc[r, c]
+                if pd.isna(val):
+                    continue                     
+                if target_value is None or val == target_value:
+                    count_hits += 1
+            freq_mat[r, c] = count_hits / n_runs  
+
+    return pd.DataFrame(freq_mat, index=union_labels, columns=union_labels)
+
+# -----------------------------------
+# Average Matrix Calculation
+# -----------------------------------
+def calculate_average_matrix(dsm_data, union_labels, key):
+    matrix = np.zeros((len(union_labels), len(union_labels)))
+    for r in range(len(union_labels)):
+        for c in range(len(union_labels)):
+            values = [d[key].iloc[r, c] for d in dsm_data if not pd.isna(d[key].iloc[r, c])]
+            matrix[r, c] = np.mean(values) if values else np.nan
+    return pd.DataFrame(matrix, index=union_labels, columns=union_labels)
+
+# -----------------------------------
+# Save Metrics and Matrices to Excel
+# -----------------------------------
+def save_metrics_and_matrices(dsm_data, union_labels, output_file):
+    summary_df, overview_df = aggregate_evaluation_metrics(dsm_data)
+    entropy_df, summary_df, avg_entropy = calculate_entropy_per_cell(dsm_data, union_labels, summary_df)
+    summary_df, performance_df = calculate_final_quality_metric(dsm_data, union_labels, summary_df, entropy_df, avg_entropy)
+    uncertainty_df = calculate_frequency_matrix(dsm_data, union_labels, 'uncertainty_dsm', 1)
+    matched_df = calculate_frequency_matrix(dsm_data, union_labels, 'matched_dsm', 1)
+    mismatch_df = calculate_frequency_matrix(dsm_data, union_labels, 'mismatch_dsm', None) 
+    avg_dsm_df = calculate_average_matrix(dsm_data, union_labels, 'dsm')
+    avg_mismatch_df = calculate_average_matrix(dsm_data, union_labels, 'mismatch_dsm')
+    fill_ratio_df = calculate_fill_ratio_matrix(dsm_data, union_labels)
+    raw_agreement_df, summary_df = calculate_raw_agreement(dsm_data, union_labels, summary_df)
+
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        overview_df.to_excel(writer, sheet_name='Overview_N_DSMs', index=False)
+        summary_df.to_excel(writer, sheet_name='Summary', index=False)
+        performance_df.to_excel(writer, sheet_name='Performance Quality', index=True)
+        entropy_df.to_excel(writer, sheet_name='Entropy Matrix', index=True)
+        uncertainty_df.to_excel(writer, sheet_name='Uncertainty Frequency', index=True)
+        avg_dsm_df.to_excel(writer, sheet_name='Average DSM Values', index=True)
+        matched_df.to_excel(writer, sheet_name='Matched Frequency', index=True)
+        mismatch_df.to_excel(writer, sheet_name='Mismatch Frequency', index=True)
+        avg_mismatch_df.to_excel(writer, sheet_name='Average Mismatch Values', index=True)
+        raw_agreement_df.to_excel(writer, sheet_name='Raw Agreement Matrix', index=True)
+        fill_ratio_df.to_excel(writer, sheet_name='Fill Ratio Matrix', index=True)
+    return overview_df, summary_df, performance_df, entropy_df, uncertainty_df, avg_dsm_df, matched_df, mismatch_df, avg_mismatch_df, fill_ratio_df, raw_agreement_df
+    
+# -----------------------------------
+# Heatmap Generation
+# -----------------------------------
+def generate_dsm_heatmaps(performance_df, entropy_df, uncertainty_df, avg_dsm_df, matched_df, mismatch_df, avg_mismatch_df, fill_ratio_df, raw_agreement_df, union_labels, output_folder, output_prefix):
+
+    def _format_y_labels(labels):
+        return [f"{i+1}: {label}" for i, label in enumerate(labels)]
+
+    def _plot_heatmap(data, title, filename, cmap, vmin=None, vmax=None, colorbar_label="Value"):
+        plt.figure(figsize=(10, 8))
+        ax = sns.heatmap(
+            data,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            annot=True,
+            fmt=".3f",
+            annot_kws={"size": 12},
+            cbar_kws={"label": colorbar_label},
+            linewidths=0.5,
+            linecolor="gray",
+            square=True,
+            xticklabels=[str(i + 1) for i in range(len(union_labels))],
+            yticklabels=_format_y_labels(union_labels)
+        )
+
+        cbar = ax.collections[0].colorbar
+        cbar.ax.tick_params(labelsize=14)
+        cbar.ax.set_ylabel(colorbar_label, fontsize=16)
+
+        plt.title(title, fontsize=20, pad=20)
+        plt.xlabel("Component Index (j)", fontsize=16)
+        plt.ylabel("Component Index and Name (i)", fontsize=16)
+        plt.xticks(rotation=0, fontsize=14)
+        plt.yticks(rotation=0, fontsize=14)
+        plt.tight_layout()
+        plt.savefig(filename, dpi=300)
+        plt.close()
+
+    _plot_heatmap(matched_df, "Matched Frequency Heatmap (GEN = GT)", os.path.join(output_folder, f"{output_prefix}_matched_heatmap.png"), cmap="viridis", vmin=0, vmax=1)
+    _plot_heatmap(entropy_df, "Entropy Heatmap", os.path.join(output_folder, f"{output_prefix}_entropy_heatmap.png"), cmap="Reds_r", vmin=0, vmax=1)
+    _plot_heatmap(mismatch_df, "Mismatch Frequency Heatmap (GEN ≠ GT)", os.path.join(output_folder, f"{output_prefix}_mismatch_heatmap.png"), cmap="viridis", vmin=0, vmax=1)
+    _plot_heatmap(uncertainty_df, "Uncertainty Frequency Heatmap (GEN == 0)", os.path.join(output_folder, f"{output_prefix}_uncertainty_heatmap.png"), cmap="viridis", vmin=0, vmax=1)
+    _plot_heatmap(performance_df, "Performance Quality Heatmap (Q)", os.path.join(output_folder, f"{output_prefix}_performance_quality_heatmap.png"), cmap="Reds", vmin=0, vmax=1)
+    _plot_heatmap(avg_dsm_df, "Average DSM Values Heatmap", os.path.join(output_folder, f"{output_prefix}_avg_dsm_values_heatmap.png"), cmap="coolwarm", vmin=-1, vmax=1)
+    _plot_heatmap(fill_ratio_df, "Fill Ratio Heatmap", os.path.join(output_folder, f"{output_prefix}_fill_ratio_heatmap.png"), cmap="viridis", vmin=0, vmax=1)
+    _plot_heatmap(raw_agreement_df, "Raw Agreement Heatmap", os.path.join(output_folder, f"{output_prefix}_raw_agreement_heatmap.png"), cmap="viridis", vmin=0, vmax=1)
+# -----------------------------------
+# Execute Pipeline
+# -----------------------------------
+def execute_pipeline(input_folder=None, output_folder=None):
+    """
+    Main pipeline to aggregate DSM evaluation results.
+
+    Steps:
+    1. Load DSM runs from Evaluated_DSMs.
+    2. Compute Fleiss’ kappa, raw agreement, entropy, quality metric Q.
+    3. Save structured outputs to Excel.
+    4. Generate diagnostic heatmaps.
+    """
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    if input_folder is None:
+        input_folder = os.path.join(base_dir, 'DSM_Evaluation_Results', 'Evaluated_DSMs')
+    if output_folder is None:
+        output_folder = os.path.join(base_dir, 'DSM_Evaluation_Results', 'Evaluation_summary')
+
+    dsm_data, union_labels = load_and_align_dsms(input_folder)
+    if not dsm_data:
+        raise FileNotFoundError(f"No DSM .xlsx files found in {input_folder}")
+
+    print(f"Sample Size: {len(dsm_data)} | Unique Labels: {len(union_labels)}")
+
+    kappa_df, avg_kappa = calculate_fleiss_kappa_matrix(dsm_data, union_labels)
+    print(f"Average Fleiss’ Kappa across DSM cells: {avg_kappa:.4f}")
+
+    # Save Fleiss’ Kappa results
+    excel_path = os.path.join(output_folder, "Fleiss_Kappa_Matrix.xlsx")
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        kappa_df.to_excel(writer, sheet_name='Fleiss Kappa')
+        pd.DataFrame([["Average Fleiss Kappa", avg_kappa]], columns=["Metric", "Value"]).to_excel(writer, sheet_name='Summary', index=False)
+
+    # Extract naming from first file for consistency
+    gen_dsm = dsm_data[0]['file_name'].split('_')[0]
+    gt_dsm = dsm_data[0]['file_name'].split('_')[3] + '_' + dsm_data[0]['file_name'].split('_')[5]
+
+    output_prefix = f"{gen_dsm}_{gt_dsm}"
+    output_filename = f"Summary_{output_prefix}.xlsx"
+    output_file = os.path.join(output_folder, output_filename)
+
+    # Save summary metrics and generate heatmaps
+    (overview_df, summary_df, performance_df, entropy_df,
+     uncertainty_frequency_df, avg_DSM_value_df, matched_frequency_df,
+     mismatch_frequency_df, avg_mismatch_df, fill_ratio_df, raw_agreement_df) = \
+        save_metrics_and_matrices(dsm_data, union_labels, output_file)
+
+    generate_dsm_heatmaps(performance_df, entropy_df,
+                          uncertainty_frequency_df, avg_DSM_value_df,
+                          matched_frequency_df, mismatch_frequency_df,
+                          avg_mismatch_df, fill_ratio_df, raw_agreement_df,
+                          union_labels, output_folder, output_prefix)
+
+
+if __name__ == "__main__":
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    input_folder = os.path.join(script_dir, "DSM_Evaluation_Results", "Evaluated_DSMs")
+    output_folder = os.path.join(script_dir, "DSM_Evaluation_Results", "Evaluation_summary")
+    execute_pipeline(input_folder, output_folder)
